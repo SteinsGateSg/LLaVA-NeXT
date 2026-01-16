@@ -121,6 +121,9 @@ class RLHFDataset(Dataset):
         self.max_pixels = max_pixels
         self.min_pixels = min_pixels
         self.filter_overlong_prompts = filter_overlong_prompts
+        self.image_token_id = tokenizer.convert_tokens_to_ids("<|image_pad|>")
+        if self.image_token_id is None:
+            self.image_token_id = -1
 
         if "@" in data_path:
             data_path, data_split = data_path.split("@")
@@ -231,5 +234,6 @@ class RLHFDataset(Dataset):
         example["attention_mask"] = attention_mask
         example["position_ids"] = position_ids
         example["raw_prompt_ids"] = raw_prompt_ids
+        example["image_token_id"] = torch.tensor(self.image_token_id, dtype=torch.long)
         example["ground_truth"] = example.pop(self.answer_key)
         return example

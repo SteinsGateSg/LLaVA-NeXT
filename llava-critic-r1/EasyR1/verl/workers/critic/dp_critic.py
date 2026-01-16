@@ -20,6 +20,7 @@ from collections import defaultdict
 from typing import Any, Dict
 
 import torch
+import torch.nn.functional as F
 from ray.experimental.tqdm_ray import tqdm
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -49,7 +50,9 @@ class DataParallelPPOCritic(BasePPOCritic):
         self.critic_module = critic_module
         self.critic_optimizer = critic_optimizer
 
-    def _forward_micro_batch(self, micro_batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+    def _forward_micro_batch(
+        self, micro_batch: Dict[str, torch.Tensor], return_hidden_states: bool = False
+    ) -> torch.Tensor:
         input_ids = micro_batch["input_ids"]
         batch_size, seqlen = input_ids.shape
         attention_mask = micro_batch["attention_mask"]
@@ -67,6 +70,8 @@ class DataParallelPPOCritic(BasePPOCritic):
                 )
 
         if self.config.padding_free:
+            if return_hidden_states:
+                raise ValueError("Contrastive loss is not supported with padding_free.")
             input_ids_rmpad, indices, *_ = unpad_input(
                 input_ids.unsqueeze(-1), attention_mask
             )  # input_ids_rmpad (total_nnz, ...)
@@ -97,6 +102,8 @@ class DataParallelPPOCritic(BasePPOCritic):
                 position_ids=position_ids_rmpad,
                 **multi_modal_inputs,
                 use_cache=False,
+                output_hidden_states=False,
+                return_dict=True,
             )  # prevent model thinks we are generating
             values_rmpad = output.logits
             values_rmpad = values_rmpad.squeeze(0)  # (total_nnz)
@@ -108,6 +115,7 @@ class DataParallelPPOCritic(BasePPOCritic):
             # pad it back
             values = pad_input(values_rmpad, indices=indices, batch=batch_size, seqlen=seqlen).squeeze(-1)
             values = values[:, -response_length - 1 : -1]
+            return values
         else:
             output = self.critic_module(
                 input_ids=input_ids,
@@ -115,11 +123,59 @@ class DataParallelPPOCritic(BasePPOCritic):
                 position_ids=position_ids,
                 **multi_modal_inputs,
                 use_cache=False,
+                output_hidden_states=return_hidden_states,
+                return_dict=True,
             )
             values: torch.Tensor = output.logits
             values = values[:, -response_length - 1 : -1].squeeze(-1)  # (bsz, response_length, vocab_size)
-
+            if return_hidden_states:
+                hidden_states = output.hidden_states[-1]
+                return values, hidden_states
         return values
+
+    def _get_prompt_learner(self) -> nn.Module | None:
+        module = self.critic_module
+        if isinstance(module, FSDP):
+            module = module.module
+        return getattr(module, "prompt_learner", None)
+
+    def _masked_mean(self, features: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        mask = mask.to(features.dtype)
+        mask = mask.unsqueeze(-1)
+        denom = mask.sum(dim=1).clamp_min(1.0)
+        return (features * mask).sum(dim=1) / denom
+
+    def _compute_contrastive_loss(
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        response_length: int,
+        image_token_id: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        prompt_learner = self._get_prompt_learner()
+        if prompt_learner is None:
+            return None
+        if image_token_id is None:
+            return None
+        image_token_id = image_token_id.view(-1, 1)
+        prompt_mask = attention_mask[:, :-response_length].bool()
+        prompt_hidden = hidden_states[:, :-response_length]
+        image_mask = (input_ids[:, :-response_length] == image_token_id) & prompt_mask
+        text_mask = prompt_mask & ~image_mask
+        valid_mask = image_mask.any(dim=1) & text_mask.any(dim=1)
+        if valid_mask.sum() < 2:
+            return None
+
+        text_embeddings = self._masked_mean(prompt_hidden[valid_mask], text_mask[valid_mask])
+        image_embeddings = self._masked_mean(prompt_hidden[valid_mask], image_mask[valid_mask])
+        prompt_embeddings = prompt_learner(image_embeddings)
+
+        text_embeddings = F.normalize(text_embeddings, dim=-1)
+        prompt_embeddings = F.normalize(prompt_embeddings, dim=-1)
+        logits = torch.matmul(prompt_embeddings, text_embeddings.transpose(0, 1)) / self.config.contrastive_temperature
+        labels = torch.arange(logits.size(0), device=logits.device)
+        return F.cross_entropy(logits, labels)
 
     def _optimizer_step(self) -> torch.Tensor:
         if isinstance(self.critic_module, FSDP):
@@ -169,7 +225,15 @@ class DataParallelPPOCritic(BasePPOCritic):
     def update_critic(self, data: DataProto) -> Dict[str, Any]:
         self.critic_module.train()
 
-        select_keys = ["input_ids", "responses", "attention_mask", "position_ids", "values", "returns"]
+        select_keys = [
+            "input_ids",
+            "responses",
+            "attention_mask",
+            "position_ids",
+            "values",
+            "returns",
+            "image_token_id",
+        ]
         if "multi_modal_inputs" in data.non_tensor_batch.keys():
             non_tensor_select_keys = ["multi_modal_inputs"]
         else:
@@ -201,7 +265,20 @@ class DataParallelPPOCritic(BasePPOCritic):
                     response_length = responses.size(1)
                     action_mask = attention_mask[:, -response_length - 1 : -1]  # shift left for value computation
 
-                    vpreds = self._forward_micro_batch(model_inputs)
+                    if self.config.enable_contrastive_loss and not self.config.padding_free:
+                        vpreds, hidden_states = self._forward_micro_batch(
+                            model_inputs, return_hidden_states=True
+                        )
+                        contrastive_loss = self._compute_contrastive_loss(
+                            hidden_states=hidden_states,
+                            input_ids=model_inputs["input_ids"],
+                            attention_mask=attention_mask,
+                            response_length=response_length,
+                            image_token_id=model_inputs.get("image_token_id"),
+                        )
+                    else:
+                        vpreds = self._forward_micro_batch(model_inputs)
+                        contrastive_loss = None
                     vf_loss, vf_clipfrac = core_algos.compute_value_loss(
                         vpreds=vpreds,
                         returns=returns,
@@ -209,7 +286,10 @@ class DataParallelPPOCritic(BasePPOCritic):
                         action_mask=action_mask,
                         cliprange_value=self.config.cliprange_value,
                     )
-                    loss = vf_loss / gradient_accumulation
+                    if contrastive_loss is not None:
+                        loss = (vf_loss + self.config.contrastive_loss_weight * contrastive_loss) / gradient_accumulation
+                    else:
+                        loss = vf_loss / gradient_accumulation
                     loss.backward()
 
                     batch_metrics = {
@@ -217,6 +297,8 @@ class DataParallelPPOCritic(BasePPOCritic):
                         "critic/vf_clipfrac": vf_clipfrac.detach().item(),
                         "critic/vpred_mean": VF.masked_mean(vpreds, action_mask).detach().item(),
                     }
+                    if contrastive_loss is not None:
+                        batch_metrics["critic/contrastive_loss"] = contrastive_loss.detach().item()
                     append_to_dict(metrics, batch_metrics)
 
                 grad_norm = self._optimizer_step()
