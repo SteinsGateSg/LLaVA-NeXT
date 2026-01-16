@@ -10,10 +10,12 @@ python3 -m verl.trainer.main \
     data.prompt_key=question \
     data.max_prompt_length=6142 \
     worker.actor.is_entropy_reg=False \
+    worker.critic.enable_contrastive_loss=True \
+    worker.critic.contrastive_loss_weight=0.1 \
+    worker.critic.contrastive_temperature=0.07 \
     worker.actor.global_batch_size=128 \
     worker.actor.micro_batch_size_per_device_for_update=4 \
     worker.actor.micro_batch_size_per_device_for_experience=8 \
     worker.actor.model.model_path=${MODEL_PATH} \
     trainer.experiment_name=qwen2_5_vl_7b_llava_critic_grpo \
     trainer.n_gpus_per_node=8 
-

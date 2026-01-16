@@ -38,6 +38,7 @@ from transformers import (
 from transformers.modeling_utils import no_init_weights
 
 from ..models.monkey_patch import apply_ulysses_patch
+from ..models.prompt_learner import PromptLearnerWrapper
 from ..protocol import DataProto
 from ..single_controller.base import Worker
 from ..single_controller.base.decorator import Dispatch, register
@@ -236,6 +237,13 @@ class FSDPWorker(Worker):
 
         if not (self._is_actor or self._is_critic):
             model.requires_grad_(False)
+
+        if self._is_critic and self.config.critic.enable_contrastive_loss:
+            hidden_size = getattr(self.model_config, "hidden_size", None)
+            if hidden_size is None:
+                raise ValueError("Contrastive loss requires model_config.hidden_size to be set.")
+            prompt_hidden_size = self.config.critic.prompt_hidden_size or hidden_size
+            model = PromptLearnerWrapper(model=model, hidden_size=hidden_size, prompt_hidden_size=prompt_hidden_size)
 
         if model_config.freeze_vision_tower:
             if hasattr(model, "visual"):

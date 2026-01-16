@@ -31,6 +31,10 @@ class CriticConfig:
     ppo_epochs: int = 1
     padding_free: bool = False
     ulysses_sequence_parallel_size: int = 1
+    enable_contrastive_loss: bool = False
+    contrastive_loss_weight: float = 0.0
+    contrastive_temperature: float = 0.07
+    prompt_hidden_size: int = 0
     model: ModelConfig = field(default_factory=ModelConfig)
     optim: OptimConfig = field(default_factory=OptimConfig)
     fsdp: FSDPConfig = field(default_factory=FSDPConfig)
